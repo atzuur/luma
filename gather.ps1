@@ -12,7 +12,9 @@ Function Find-NewName {
     $Path
 }
 
+mkdir .\all
 rm -r .\all\*
 git submodule sync
+git submodule update
 Get-ChildItem .\TCL\docs\* -Include *.md -Exclude _* -Recurse | % { Copy-Item -Path $_ -Destination (Find-NewName ".\all\$((Get-Item $_).Name)") }
 python clean.py all
