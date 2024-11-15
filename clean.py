@@ -8,6 +8,7 @@ ENCLOSED_DIGIT = re.compile(r"\[\d\]")
 NUMBERED_LIST = re.compile(r"^\d+[.)]\s")
 COLOR_CODE = re.compile(r"{color{.{6}}([^}]*)")
 MULTISPACE = re.compile(r" {2,}")
+DISCORD_TAG = re.compile(r"\s?-?.[^\s]*\\?#[0-9]{4}")
 
 
 def find_closing_bracket(s: str, start: int) -> int:
@@ -57,6 +58,8 @@ def clean_line(line: str) -> str:
         "original ticket:", "search:", "sidebar_position:",
     ))):
         return ""
+    
+    line = "".join(c for c in line if ord(c) <= ord('°'))
 
     line = line \
         .replace("*", "") \
@@ -70,11 +73,12 @@ def clean_line(line: str) -> str:
         .replace("<br/>", "")
 
     line = clear_nested_brackets(line)
+    line = re.sub(HYPERLINK, lambda m: m.group(1), line) # keep link names
     line = re.sub(ENCLOSED_DIGIT, "", line)
     line = re.sub(NUMBERED_LIST, "", line)
-    line = re.sub(HYPERLINK, lambda m: m.group(1), line) # keep link names
     line = re.sub(COLOR_CODE, lambda m: m.group(1), line) # keep colored text
     line = re.sub(MULTISPACE, " ", line)
+    line = re.sub(DISCORD_TAG, "", line)
     line = line.strip() + "\n"
 
     if len(line.split(" ")) < 3:
@@ -91,7 +95,6 @@ def clean_file(file: Path) -> Iterable[str]:
                 in_code_or_latex = not in_code_or_latex
             if not in_code_or_latex:
                 yield clean_line(line)
-
 
 if __name__ == "__main__":
     if len(sys.argv) != 2:
