@@ -98,10 +98,10 @@ def clean_file(file: Path) -> Iterable[str]:
 
 if __name__ == "__main__":
     if len(sys.argv) != 2:
-        print("Usage: python clean.py <directory>")
+        print(f"Usage: python {__file__}.py <directory>")
         sys.exit(1)
 
     files = Path(sys.argv[1]).iterdir()
-    with open("material.txt", "w", encoding="utf-8") as out:
+    with open("genshin.txt", "w", encoding="utf-8") as out:
         for file in files:
             out.writelines(clean_file(file))

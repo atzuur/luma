@@ -4,7 +4,7 @@ from time import perf_counter
 
 from modules import *
 
-corpus = "shsp"
+corpus = "data/shsp"
 with open(f"{corpus}.txt", "r", encoding="utf-8") as f:
     text = f.read()
 
