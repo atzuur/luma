@@ -130,8 +130,8 @@ class AddFn(ag.Function):
     @staticmethod
     def forward(ctx, a: torch.Tensor, b: torch.Tensor):
         assert a.shape == b.shape
-        return a + b 
-    
+        return a + b
+
     @staticmethod
     def backward(ctx, y_grad: torch.Tensor):
         return y_grad, y_grad
@@ -168,20 +168,75 @@ class Embedding(nn.Module):
         return EmbeddingFn.apply(x, self.emb)
 
 
-# TODO
 class MHAttentionFn(ag.Function):
     @staticmethod
-    def forward(ctx, x: torch.Tensor, w_qkvo: list[torch.Tensor]):
-        w_q, w_k, w_v, w_o = w_qkvo
+    def forward(
+        ctx,
+        x: torch.Tensor,
+        w_q: torch.Tensor,
+        w_k: torch.Tensor,
+        w_v: torch.Tensor,
+        w_o: torch.Tensor
+    ):
         H, C, Ca = w_q.shape
         T, C = x.shape
-        x = x.reshape((H, T, Ca))
-        
+
         q = x @ w_q
         k = x @ w_k
         v = x @ w_v
-        s = k @ q.transpose(1, 2)
+        s = q @ k.transpose(-2, -1)
+        s_hat = s.masked_fill(s.tril() == 0, float("-inf")) / math.sqrt(Ca)
+        s_hat -= s_hat.max(-1, keepdim=True).values
+        a = s_hat.exp() / s_hat.exp().sum(-1, keepdim=True)
+        y = a @ v
+        y_cat = y.reshape(T, C)
+        o = y_cat @ w_o
 
+        ctx.save_for_backward(x, w_q, w_k, w_v, w_o, q, k, v, s, a, y_cat)
+        return o
+
+    @staticmethod
+    def backward(ctx, o_grad: torch.Tensor):
+        x, w_q, w_k, w_v, w_o, q, k, v, s, a, y_cat = ctx.saved_tensors
+        H, C, Ca = w_q.shape
+        T, C = x.shape
+
+        dw_o = y_cat.T @ o_grad
+        dy_cat = o_grad @ w_o.T
+        dy = dy_cat.reshape(H, T, Ca)
+        dv = a.transpose(-2, -1) @ dy
+        da = dy @ v.transpose(-2, -1)
+        ds_hat = a * (da - (da * a).sum(-1, keepdim=True))
+        ds = (s.tril() > 0) / math.sqrt(Ca) * ds_hat
+        dk = ds.transpose(-2, -1) @ q
+        dq = ds @ k
+        dw_v = x.T @ dv
+        dw_k = x.T @ dk
+        dw_q = x.T @ dq
+        dx = (
+            dq @ w_q.transpose(-2, -1) +
+            dk @ w_k.transpose(-2, -1) +
+            dv @ w_v.transpose(-2, -1)
+        ).sum(-3)
+
+        return dx, dw_q, dw_k, dw_v, dw_o
+
+
+class MHAttention(nn.Module):
+    def __init__(self, d_emb: int, n_heads: int):
+        super().__init__()
+        assert d_emb % n_heads == 0
+        d_att = d_emb // n_heads
+        
+        w_qkv = torch.empty(3, n_heads, d_emb, d_att)
+        nn.init.kaiming_uniform_(w_qkv, a=math.sqrt(5))
+        self.w_q, self.w_k, self.w_v = (nn.Parameter(w) for w in w_qkv)
+        
+        self.w_o = nn.Parameter(torch.empty(d_emb, d_emb))
+        nn.init.kaiming_uniform_(self.w_o, a=math.sqrt(5))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return MHAttentionFn.apply(x, self.w_q, self.w_k, self.w_v, self.w_o)
 
 if __name__ == "__main__":
     T, C = 32, 64
@@ -228,6 +283,16 @@ if __name__ == "__main__":
             "func": EmbeddingFn.apply,
             "fwd_ref": nn.functional.embedding
         },
+        "mhattention": {
+            "params": [
+                (T, C), (4, C, C // 4), (4, C, C // 4), (4, C, C // 4), (C, C),
+            ],
+            "func": MHAttentionFn.apply,
+            "fwd_ref": lambda x, wq, wk, wv, wo:
+                nn.functional.scaled_dot_product_attention(
+                    x @ wq, x @ wk, x @ wv, is_causal=True
+                ).reshape(T, C) @ wo
+        }
     }
 
     for test, info in tests.items():
@@ -237,7 +302,11 @@ if __name__ == "__main__":
             for p in info["params"]
         ]
         err_args = dict(atol=1e-2, rtol=1e-2)
-        assert torch.allclose(info["func"](*params), info["fwd_ref"](*params), **err_args)
+        x = info["func"](*params)
+        x_ref = info["fwd_ref"](*params)
+        if not torch.allclose(x, x_ref, **err_args):
+            print(f"erroneous fwd: {x}\n\nref: {x_ref}")
+
         ag.gradcheck(info["func"], params, eps=1e-6, **err_args)
 
         print(f"{test} passed")

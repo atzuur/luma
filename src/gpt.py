@@ -82,11 +82,11 @@ vocab_size = len(vocab)
 def decode(a: torch.Tensor) -> str:
     return "".join(vocab[i] for i in a)
 
-ctx_size = 32
+ctx_size = 64
 n_batches = 8
-n_layers = 1
-d_emb = 64
-n_epochs = 1000
+n_layers = 4
+d_emb = 128
+n_epochs = 24000
 
 @cache
 def pos_emb_fn(max_t: int) -> torch.Tensor:
@@ -109,6 +109,9 @@ class DTransformer(nn.Module):
         super().__init__()
         self.tok_emb = Embedding(vocab_size, d_emb)
 
+        self.ln1 = LayerNorm(d_emb)
+        self.mh_att = MHAttention(d_emb, 4)
+
         self.ln2 = LayerNorm(d_emb)
         self.lin1 = Linear(d_emb, 4 * d_emb)
         self.gelu = GELU()
@@ -121,8 +124,10 @@ class DTransformer(nn.Module):
 
     def forward(self, tokens: torch.Tensor, targets: torch.Tensor = None):
         x = self.tok_emb(tokens) + pos_emb_fn(len(tokens))
-
         for _ in range(n_layers):
+            x_tild = self.ln1(x)
+            x_tild = self.mh_att(x_tild)
+            x = self.add(x, x_tild)
             x_tild = self.ln2(x)
             x_tild = self.lin2(self.gelu(self.lin1(x_tild)))
             x = self.add(x, x_tild)
@@ -143,17 +148,22 @@ class DTransformer(nn.Module):
             total += loss
         return total / 200
 
-    def generate(self, tokens: torch.Tensor, max_new_tokens: int):
+    def generate(self, tokens: torch.Tensor, max_new_tokens: int, top_k: int | None = None):
         for _ in range(max_new_tokens):
             tokens_ctx = tokens[-ctx_size:]
-            logits, _ = self(tokens_ctx)
-            probs = torch.softmax(logits[-1], dim=0)
+            logits, _ = self(tokens_ctx)[-1]
+            if top_k is not None:
+                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                logits[logits < v[:, [-1]]] = -float('inf')
+            
+            probs = torch.softmax(logits, dim=0)
             tokens_next = torch.multinomial(probs, num_samples=1)
             tokens = torch.cat((tokens, tokens_next), dim=0)
         return tokens
 
+
 model = DTransformer()
-optimizer = torch.optim.SGD(model.parameters(), lr=1)
+optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
 try:
     for e in range(n_epochs):
         if e % 200 == 0 or e == n_epochs - 1:
@@ -163,14 +173,10 @@ try:
         logits, loss = model(x, y)
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
+        nn.utils.clip_grad_value_(model.parameters(), clip_value=1.0)
         optimizer.step()
 except KeyboardInterrupt:
     pass
 
-print(decode(model.generate(torch.zeros(1, dtype=torch.int64), 500)))
-
-# import torchviz
-# x, y = get_batch()
-# logits, loss = model(x, y)
-# graph = torchviz.make_dot(loss, params=dict(model.named_parameters()))
-# graph.save()
+prompt_start = torch.randint(len(tokens) - 11, size=(1,))
+print(decode(model.generate(tokens[prompt_start:prompt_start + 11], 500, top_k=32)))
