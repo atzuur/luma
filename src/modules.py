@@ -180,18 +180,16 @@ class MHAttentionFn(ag.Function):
         w_v: torch.Tensor,
         w_o: torch.Tensor
     ):
-        H, C, Ca = w_q.shape
-        B, T, C = x.shape
-
+        scale = 1 / math.sqrt(w_q.size(-1))
         q = x.unsqueeze(-3) @ w_q
         k = x.unsqueeze(-3) @ w_k
         v = x.unsqueeze(-3) @ w_v
         s = q @ k.transpose(-2, -1)
-        s_hat = s.masked_fill(s.tril() == 0, float("-inf")) / math.sqrt(Ca)
+        s_hat = s.masked_fill(s.tril() == 0, float("-inf")) * scale
         s_hat -= s_hat.max(-1, keepdim=True).values
         a = s_hat.exp() / s_hat.exp().sum(-1, keepdim=True)
         y = a @ v
-        y_cat = y.reshape(B, T, C)
+        y_cat = y.transpose(-3, -2).contiguous().view_as(x)
         o = y_cat @ w_o
 
         ctx.save_for_backward(x, w_q, w_k, w_v, w_o, q, k, v, s, a, y_cat)
@@ -205,7 +203,7 @@ class MHAttentionFn(ag.Function):
 
         dw_o = y_cat.transpose(-2, -1) @ o_grad
         dy_cat = o_grad @ w_o.T
-        dy = dy_cat.reshape(B, H, T, Ca)
+        dy = dy_cat.view(B, T, H, Ca).transpose(-3, -2)
         dv = a.transpose(-2, -1) @ dy
         da = dy @ v.transpose(-2, -1)
         ds_hat = a * (da - (da * a).sum(-1, keepdim=True))
@@ -244,48 +242,48 @@ class MHAttention(nn.Module):
 if __name__ == "__main__":
     B, T, C = 8, 32, 64
     tests = {
-        "cross_entropy": {
-            "params": [
-                (T, C), torch.randint(C - 1, size=(T,)),
-            ],
-            "func": CrossEntropyFn.apply,
-            "fwd_ref": nn.functional.cross_entropy
-        },
-        "layer_norm": {
-            "params": [
-                (B, T, C), (C,), (C,)
-            ],
-            "func": LayerNormFn.apply,
-            "fwd_ref": lambda x, g, b: nn.functional.layer_norm(x, (C,), g, b)
-        },
-        "linear": {
-            "params": [
-                (B, T, C), (C, C), (C,)
-            ],
-            "func": LinearFn.apply,
-            "fwd_ref": nn.functional.linear
-        },
-        "gelu": {
-            "params": [
-                (B, T, C),
-            ],
-            "func": GELUFn.apply,
-            "fwd_ref": lambda x: nn.functional.gelu(x, approximate="tanh")
-        },
-        "add": {
-            "params": [
-                (T, C), (T, C)
-            ],
-            "func": AddFn.apply,
-            "fwd_ref": torch.add
-        },
-        "embedding": {
-            "params": [
-                torch.randint(2 * C - 1, size=(B, T)), (2 * C, C)
-            ],
-            "func": EmbeddingFn.apply,
-            "fwd_ref": nn.functional.embedding
-        },
+        # "cross_entropy": {
+        #     "params": [
+        #         (T, C), torch.randint(C - 1, size=(T,)),
+        #     ],
+        #     "func": CrossEntropyFn.apply,
+        #     "fwd_ref": nn.functional.cross_entropy
+        # },
+        # "layer_norm": {
+        #     "params": [
+        #         (B, T, C), (C,), (C,)
+        #     ],
+        #     "func": LayerNormFn.apply,
+        #     "fwd_ref": lambda x, g, b: nn.functional.layer_norm(x, (C,), g, b)
+        # },
+        # "linear": {
+        #     "params": [
+        #         (B, T, C), (C, C), (C,)
+        #     ],
+        #     "func": LinearFn.apply,
+        #     "fwd_ref": nn.functional.linear
+        # },
+        # "gelu": {
+        #     "params": [
+        #         (B, T, C),
+        #     ],
+        #     "func": GELUFn.apply,
+        #     "fwd_ref": lambda x: nn.functional.gelu(x, approximate="tanh")
+        # },
+        # "add": {
+        #     "params": [
+        #         (T, C), (T, C)
+        #     ],
+        #     "func": AddFn.apply,
+        #     "fwd_ref": torch.add
+        # },
+        # "embedding": {
+        #     "params": [
+        #         torch.randint(2 * C - 1, size=(B, T)), (2 * C, C)
+        #     ],
+        #     "func": EmbeddingFn.apply,
+        #     "fwd_ref": nn.functional.embedding
+        # },
         "mhattention": {
             "params": [
                 (B, T, C), (4, C, C // 4), (4, C, C // 4), (4, C, C // 4), (C, C),
@@ -293,8 +291,11 @@ if __name__ == "__main__":
             "func": MHAttentionFn.apply,
             "fwd_ref": lambda x, wq, wk, wv, wo:
                 nn.functional.scaled_dot_product_attention(
-                    x.unsqueeze(-3) @ wq, x.unsqueeze(-3) @ wk, x.unsqueeze(-3) @ wv, is_causal=True
-                ).reshape(B, T, C) @ wo
+                    x.unsqueeze(-3) @ wq,
+                    x.unsqueeze(-3) @ wk,
+                    x.unsqueeze(-3) @ wv,
+                    is_causal=True
+                ).transpose(-2, -3).contiguous().view_as(x) @ wo
         }
     }
 

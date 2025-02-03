@@ -1,6 +1,5 @@
+import time
 from collections import defaultdict
-from functools import cache
-from time import perf_counter
 
 from modules import *
 
@@ -26,7 +25,7 @@ def tokenize(s: str, max_vocab_size = 256) -> tuple[list, torch.Tensor]:
     assert vocab_size <= max_vocab_size
 
     merges = []
-    t1 = perf_counter()
+    t1 = time.perf_counter()
     for _ in range(max_vocab_size - vocab_size):
         pairs = defaultdict(int)
         for word, freq in word_freqs.items():
@@ -46,10 +45,10 @@ def tokenize(s: str, max_vocab_size = 256) -> tuple[list, torch.Tensor]:
                     merged_word = " ".join((*symbols[:i], "".join(pair), *symbols[i + 2:]))
             word_freqs[merged_word] = word_freqs.pop(word)
 
-    t = perf_counter() - t1
+    t = time.perf_counter() - t1
     print(f"tokenizer found {len(merges)} merges in {t:.2f} s ({t / len(merges):.2f} s/merge)")
 
-    t1 = perf_counter()
+    t1 = time.perf_counter()
     symbols = list(s)
     for pair in merges:
         i = 0
@@ -59,7 +58,7 @@ def tokenize(s: str, max_vocab_size = 256) -> tuple[list, torch.Tensor]:
             else:
                 i += 1
 
-    t = perf_counter() - t1
+    t = time.perf_counter() - t1
     print(f"tokenizer made {len(merges)} merges in {t:.2f} s ({t / len(merges):.2f} s/merge)")
 
     vocab = list(set(symbols))
@@ -69,47 +68,31 @@ def tokenize(s: str, max_vocab_size = 256) -> tuple[list, torch.Tensor]:
     return vocab, torch.as_tensor(tokens)
 
 
-# tok_path = f"{corpus}-tokens.pt"
-# vocab_path = f"{corpus}-vocab.pt"
-# try:
-#     tokens = torch.load(tok_path)
-#     vocab = torch.load(vocab_path)
-# except FileNotFoundError:
-#     vocab, tokens = tokenize(text)
-#     torch.save(tokens, tok_path)
-#     torch.save(vocab, vocab_path)
+tok_path = f"{corpus}-tokens.pt"
+vocab_path = f"{corpus}-vocab.pt"
+try:
+    tokens = torch.load(tok_path)
+    vocab = torch.load(vocab_path)
+except FileNotFoundError:
+    vocab, tokens = tokenize(text)
+    torch.save(tokens, tok_path)
+    torch.save(vocab, vocab_path)
 
-# assert isinstance(vocab, list)
-# vocab_size = len(vocab)
+assert isinstance(vocab, list)
+vocab_size = len(vocab)
 
-# def decode(a: torch.Tensor) -> str:
-#     return "".join(vocab[i] for i in a)
-
-chars = sorted(list(set(text)))
-stoi = { ch:i for i,ch in enumerate(chars) }
-itos = { i:ch for i,ch in enumerate(chars) }
-encode = lambda s: [stoi[c] for c in s]
-decode = lambda l: ''.join([itos[i.item()] for i in l])
-
-tokens = torch.tensor(encode(text), dtype=torch.long)
-vocab_size = len(chars)
-
+def decode(a: torch.Tensor) -> str:
+    return "".join(vocab[i] for i in a)
 
 ctx_size = 64
-n_batches = 12
+n_batches = 32
 n_layers = 4
+n_heads = 4
 d_emb = 128
-n_epochs = 2000
 
-# @cache
-# def pos_emb_fn(max_t: int) -> torch.Tensor:
-#     idxs = torch.arange(d_emb).unsqueeze(0)
-#     ts = torch.arange(max_t).unsqueeze(1)
-#     return torch.where(
-#         idxs % 2 == 1,
-#         torch.sin(ts / max_t ** ((idxs + 1) / d_emb)),
-#         torch.cos(ts / max_t ** (idxs / d_emb))
-#     )
+n_steps = 2000
+learning_rate = 1e-3
+warmup_steps = 100
 
 
 def get_batch():
@@ -119,6 +102,15 @@ def get_batch():
     return x, y
 
 
+def get_lr(k: int):
+    if k < warmup_steps:
+        return learning_rate * (k + 1) / (warmup_steps + 1)
+    decay_ratio = (k - warmup_steps) / (n_steps - warmup_steps)
+    coeff = 0.5 + math.cos(math.pi * decay_ratio) / 2
+    min_lr = learning_rate / 10
+    return min_lr + coeff * (learning_rate - min_lr)
+
+
 class DTransformer(nn.Module):
     def __init__(self):
         super().__init__()
@@ -126,7 +118,7 @@ class DTransformer(nn.Module):
         self.pos_emb = Embedding(ctx_size, d_emb)
 
         self.ln1 = LayerNorm(d_emb)
-        self.mh_att = MHAttention(d_emb, 4)
+        self.mh_att = MHAttention(d_emb, n_heads)
 
         self.ln2 = LayerNorm(d_emb)
         self.lin1 = Linear(d_emb, 4 * d_emb)
@@ -181,19 +173,35 @@ class DTransformer(nn.Module):
 
 
 model = DTransformer()
-optimizer = torch.optim.AdamW(model.parameters(), lr=6e-4)
+optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
 try:
-    for e in range(n_epochs):
-        if e % 200 == 0 or e == n_epochs - 1:
-            print(f"epoch {e}: {model.estimate_loss():.4f}")
+    start_t = time.perf_counter()
+    for k in range(n_steps):
+        lr = get_lr(k)
+        for param_group in optimizer.param_groups:
+            param_group['lr'] = lr
+        
+        log_interval = n_steps // 10
+        if k % log_interval == 0 or k == n_steps - 1:
+            end_t = time.perf_counter()
+            avg_t = (end_t - start_t) / log_interval
+            start_t = end_t
 
+            eta = int((n_steps - k) * avg_t)
+            eta_str = "{:02d}:{:02d}".format(*divmod(eta, 60))
+            print(
+                f"step {k}/{n_steps}: {model.estimate_loss():.4f}, "
+                f"step time: {avg_t:.2f} s, eta: {eta_str}"
+            )
+    
         x, y = get_batch()
         logits, loss = model(x, y)
-        optimizer.zero_grad(set_to_none=True)
         loss.backward()
         nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
+
 except KeyboardInterrupt:
     pass
 
-print(decode(model.generate(torch.zeros(1, dtype=torch.long), 500)))
+print(decode(model.generate(torch.zeros(1, dtype=torch.long), 1000, top_k=32)))
