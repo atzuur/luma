@@ -1,17 +1,17 @@
 import math
+from functools import reduce
+from operator import mul
+
 import torch
 import torch.autograd as ag
 from torch import nn
-
-torch.manual_seed(42)
 
 
 class CrossEntropyFn(ag.Function):
     @staticmethod
     def forward(ctx, x: torch.Tensor, y: torch.Tensor):
-        T, C = x.shape
-        ex = x.exp()
-        s = ex / ex.sum(1).unsqueeze(1)
+        T = x.size(0)
+        s = x.exp() / x.exp().sum(1).unsqueeze(1)
         ctx.save_for_backward(x, y, s)
         return -s[torch.arange(T), y].log().mean(0)
 
@@ -35,27 +35,27 @@ class LayerNormFn(ag.Function):
     @staticmethod
     def forward(ctx, x: torch.Tensor, gamma: torch.Tensor, beta: torch.Tensor):
         eps = 1e-05
-        m = x.mean(1)
-        mu = x - m.unsqueeze(1)
-        v = torch.mean(mu ** 2, 1)
+        m = x.mean(-1, keepdim=True)
+        mu = x - m
+        v = torch.mean(mu ** 2, -1)
         sigma = torch.rsqrt(v + eps)
-        y = mu * sigma.unsqueeze(1) * gamma.unsqueeze(0) + beta.unsqueeze(0)
+        y = mu * sigma.unsqueeze(-1) * gamma + beta
 
-        ctx.save_for_backward(x, gamma, beta, m, mu, v, sigma, y)
+        ctx.save_for_backward(x, gamma, mu, sigma)
         return y
 
     @staticmethod
     def backward(ctx, y_grad: torch.Tensor):
-        x, gamma, beta, m, mu, v, sigma, y = ctx.saved_tensors
-        T, C = x.shape
+        x, gamma, mu, sigma = ctx.saved_tensors
+        C = x.size(-1)
 
-        dgamma = torch.einsum('tc,tc,t->c', y_grad, mu, sigma)
-        dbeta = y_grad.sum(0)
+        dgamma = torch.einsum('btc,btc,bt->c', y_grad, mu, sigma)
+        dbeta = y_grad.sum((-3, -2))
 
         dx = (
-            y_grad * gamma.unsqueeze(0) * sigma.unsqueeze(1)
-            - 1 / C * torch.einsum('tc,c,t->t', y_grad, gamma, sigma).unsqueeze(1)
-            - 1 / C * mu * torch.einsum('tc,c,tc,t->t', y_grad, gamma, mu, sigma ** 3).unsqueeze(1)
+            y_grad * gamma * sigma.unsqueeze(-1)
+            - 1 / C * torch.einsum('btc,c,bt->bt', y_grad, gamma, sigma).unsqueeze(-1)
+            - 1 / C * mu * torch.einsum('btc,c,btc,bt->bt', y_grad, gamma, mu, sigma ** 3).unsqueeze(-1)
         )
 
         return dx, dgamma, dbeta
@@ -78,14 +78,14 @@ class LinearFn(ag.Function):
     def forward(ctx, x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor):
         ctx.save_for_backward(x, weight, bias)
         out = x @ weight.T
-        return out + bias.unsqueeze(0).expand_as(out)
+        return out + bias
 
     @staticmethod
     def backward(ctx, y_grad: torch.Tensor):
         x, weight, bias = ctx.saved_tensors
         dx = y_grad @ weight
-        dw = y_grad.T @ x
-        db = y_grad.sum(0)
+        dw = y_grad.transpose(-2, -1) @ x
+        db = y_grad.sum((-3, -2))
         return dx, dw, db
 
 
@@ -154,7 +154,9 @@ class EmbeddingFn(ag.Function):
     @staticmethod
     def backward(ctx, y_grad: torch.Tensor):
         x, emb = ctx.saved_tensors
-        demb = torch.index_add(torch.zeros_like(emb), 0, x, y_grad)
+        *D, C = y_grad.shape
+        length_dim = reduce(mul, D, 1)
+        demb = torch.zeros_like(emb).index_add_(0, x.view(length_dim), y_grad.view(length_dim, C))
         return None, demb
 
 
@@ -179,17 +181,17 @@ class MHAttentionFn(ag.Function):
         w_o: torch.Tensor
     ):
         H, C, Ca = w_q.shape
-        T, C = x.shape
+        B, T, C = x.shape
 
-        q = x @ w_q
-        k = x @ w_k
-        v = x @ w_v
+        q = x.unsqueeze(-3) @ w_q
+        k = x.unsqueeze(-3) @ w_k
+        v = x.unsqueeze(-3) @ w_v
         s = q @ k.transpose(-2, -1)
         s_hat = s.masked_fill(s.tril() == 0, float("-inf")) / math.sqrt(Ca)
         s_hat -= s_hat.max(-1, keepdim=True).values
         a = s_hat.exp() / s_hat.exp().sum(-1, keepdim=True)
         y = a @ v
-        y_cat = y.reshape(T, C)
+        y_cat = y.reshape(B, T, C)
         o = y_cat @ w_o
 
         ctx.save_for_backward(x, w_q, w_k, w_v, w_o, q, k, v, s, a, y_cat)
@@ -199,20 +201,20 @@ class MHAttentionFn(ag.Function):
     def backward(ctx, o_grad: torch.Tensor):
         x, w_q, w_k, w_v, w_o, q, k, v, s, a, y_cat = ctx.saved_tensors
         H, C, Ca = w_q.shape
-        T, C = x.shape
+        B, T, C = x.shape
 
-        dw_o = y_cat.T @ o_grad
+        dw_o = y_cat.transpose(-2, -1) @ o_grad
         dy_cat = o_grad @ w_o.T
-        dy = dy_cat.reshape(H, T, Ca)
+        dy = dy_cat.reshape(B, H, T, Ca)
         dv = a.transpose(-2, -1) @ dy
         da = dy @ v.transpose(-2, -1)
         ds_hat = a * (da - (da * a).sum(-1, keepdim=True))
         ds = (s.tril() > 0) / math.sqrt(Ca) * ds_hat
         dk = ds.transpose(-2, -1) @ q
         dq = ds @ k
-        dw_v = x.T @ dv
-        dw_k = x.T @ dk
-        dw_q = x.T @ dq
+        dw_v = (x.transpose(-2, -1).unsqueeze(-3) @ dv).sum(-4)
+        dw_k = (x.transpose(-2, -1).unsqueeze(-3) @ dk).sum(-4)
+        dw_q = (x.transpose(-2, -1).unsqueeze(-3) @ dq).sum(-4)
         dx = (
             dq @ w_q.transpose(-2, -1) +
             dk @ w_k.transpose(-2, -1) +
@@ -227,19 +229,20 @@ class MHAttention(nn.Module):
         super().__init__()
         assert d_emb % n_heads == 0
         d_att = d_emb // n_heads
-        
+
         w_qkv = torch.empty(3, n_heads, d_emb, d_att)
         nn.init.kaiming_uniform_(w_qkv, a=math.sqrt(5))
         self.w_q, self.w_k, self.w_v = (nn.Parameter(w) for w in w_qkv)
-        
+
         self.w_o = nn.Parameter(torch.empty(d_emb, d_emb))
         nn.init.kaiming_uniform_(self.w_o, a=math.sqrt(5))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return MHAttentionFn.apply(x, self.w_q, self.w_k, self.w_v, self.w_o)
 
+
 if __name__ == "__main__":
-    T, C = 32, 64
+    B, T, C = 8, 32, 64
     tests = {
         "cross_entropy": {
             "params": [
@@ -250,21 +253,21 @@ if __name__ == "__main__":
         },
         "layer_norm": {
             "params": [
-                (T, C), (C,), (C,)
+                (B, T, C), (C,), (C,)
             ],
             "func": LayerNormFn.apply,
             "fwd_ref": lambda x, g, b: nn.functional.layer_norm(x, (C,), g, b)
         },
         "linear": {
             "params": [
-                (T, C), (C, C), (C,)
+                (B, T, C), (C, C), (C,)
             ],
             "func": LinearFn.apply,
             "fwd_ref": nn.functional.linear
         },
         "gelu": {
             "params": [
-                (T, C),
+                (B, T, C),
             ],
             "func": GELUFn.apply,
             "fwd_ref": lambda x: nn.functional.gelu(x, approximate="tanh")
@@ -278,20 +281,20 @@ if __name__ == "__main__":
         },
         "embedding": {
             "params": [
-                torch.randint(T - 1, size=(T,)), (T, C)
+                torch.randint(2 * C - 1, size=(B, T)), (2 * C, C)
             ],
             "func": EmbeddingFn.apply,
             "fwd_ref": nn.functional.embedding
         },
         "mhattention": {
             "params": [
-                (T, C), (4, C, C // 4), (4, C, C // 4), (4, C, C // 4), (C, C),
+                (B, T, C), (4, C, C // 4), (4, C, C // 4), (4, C, C // 4), (C, C),
             ],
             "func": MHAttentionFn.apply,
             "fwd_ref": lambda x, wq, wk, wv, wo:
                 nn.functional.scaled_dot_product_attention(
-                    x @ wq, x @ wk, x @ wv, is_causal=True
-                ).reshape(T, C) @ wo
+                    x.unsqueeze(-3) @ wq, x.unsqueeze(-3) @ wk, x.unsqueeze(-3) @ wv, is_causal=True
+                ).reshape(B, T, C) @ wo
         }
     }
 

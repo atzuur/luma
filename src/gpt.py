@@ -4,6 +4,8 @@ from time import perf_counter
 
 from modules import *
 
+torch.manual_seed(42)
+
 corpus = "data/shsp"
 with open(f"{corpus}.txt", "r", encoding="utf-8") as f:
     text = f.read()
@@ -66,48 +68,62 @@ def tokenize(s: str, max_vocab_size = 256) -> tuple[list, torch.Tensor]:
     tokens = [stoi[s] for s in symbols]
     return vocab, torch.as_tensor(tokens)
 
-tok_path = f"{corpus}-tokens.pt"
-vocab_path = f"{corpus}-vocab.pt"
-try:
-    tokens = torch.load(tok_path)
-    vocab = torch.load(vocab_path)
-except FileNotFoundError:
-    vocab, tokens = tokenize(text)
-    torch.save(tokens, tok_path)
-    torch.save(vocab, vocab_path)
 
-assert isinstance(vocab, list)
-vocab_size = len(vocab)
+# tok_path = f"{corpus}-tokens.pt"
+# vocab_path = f"{corpus}-vocab.pt"
+# try:
+#     tokens = torch.load(tok_path)
+#     vocab = torch.load(vocab_path)
+# except FileNotFoundError:
+#     vocab, tokens = tokenize(text)
+#     torch.save(tokens, tok_path)
+#     torch.save(vocab, vocab_path)
 
-def decode(a: torch.Tensor) -> str:
-    return "".join(vocab[i] for i in a)
+# assert isinstance(vocab, list)
+# vocab_size = len(vocab)
+
+# def decode(a: torch.Tensor) -> str:
+#     return "".join(vocab[i] for i in a)
+
+chars = sorted(list(set(text)))
+stoi = { ch:i for i,ch in enumerate(chars) }
+itos = { i:ch for i,ch in enumerate(chars) }
+encode = lambda s: [stoi[c] for c in s]
+decode = lambda l: ''.join([itos[i.item()] for i in l])
+
+tokens = torch.tensor(encode(text), dtype=torch.long)
+vocab_size = len(chars)
+
 
 ctx_size = 64
-n_batches = 8
+n_batches = 12
 n_layers = 4
 d_emb = 128
-n_epochs = 24000
+n_epochs = 2000
 
-@cache
-def pos_emb_fn(max_t: int) -> torch.Tensor:
-    idxs = torch.arange(d_emb).unsqueeze(0)
-    ts = torch.arange(max_t).unsqueeze(1)
-    return torch.where(
-        idxs % 2 == 1,
-        torch.sin(ts / max_t ** ((idxs + 1) / d_emb)),
-        torch.cos(ts / max_t ** (idxs / d_emb))
-    )
+# @cache
+# def pos_emb_fn(max_t: int) -> torch.Tensor:
+#     idxs = torch.arange(d_emb).unsqueeze(0)
+#     ts = torch.arange(max_t).unsqueeze(1)
+#     return torch.where(
+#         idxs % 2 == 1,
+#         torch.sin(ts / max_t ** ((idxs + 1) / d_emb)),
+#         torch.cos(ts / max_t ** (idxs / d_emb))
+#     )
+
 
 def get_batch():
-    start_idxs = torch.randint(len(tokens) - ctx_size - 1, size=(n_batches,))
-    x = torch.stack([tokens[i:i+ctx_size] for i in start_idxs])
-    y = torch.stack([tokens[i+1:i+ctx_size+1] for i in start_idxs])
-    return x[0], y[0]
+    start_idxs = torch.randint(len(tokens) - ctx_size, size=(n_batches,))
+    x = torch.stack([tokens[i:i + ctx_size] for i in start_idxs])
+    y = torch.stack([tokens[i + 1:i + ctx_size + 1] for i in start_idxs])
+    return x, y
+
 
 class DTransformer(nn.Module):
     def __init__(self):
         super().__init__()
         self.tok_emb = Embedding(vocab_size, d_emb)
+        self.pos_emb = Embedding(ctx_size, d_emb)
 
         self.ln1 = LayerNorm(d_emb)
         self.mh_att = MHAttention(d_emb, 4)
@@ -123,7 +139,7 @@ class DTransformer(nn.Module):
         self.cross_entropy = CrossEntropy()
 
     def forward(self, tokens: torch.Tensor, targets: torch.Tensor = None):
-        x = self.tok_emb(tokens) + pos_emb_fn(len(tokens))
+        x = self.tok_emb(tokens) + self.pos_emb(torch.arange(tokens.size(-1)))
         for _ in range(n_layers):
             x_tild = self.ln1(x)
             x_tild = self.mh_att(x_tild)
@@ -133,50 +149,51 @@ class DTransformer(nn.Module):
             x = self.add(x, x_tild)
 
         x_hat = self.lnf(x)
-        logits  = self.vocab_proj(x_hat)
+        logits = self.vocab_proj(x_hat)
 
         loss = None
         if targets is not None:
-            loss = self.cross_entropy(logits, targets)
+            B, T, V = logits.shape
+            loss = self.cross_entropy(logits.view(B*T, V), targets.view(B*T))
         return logits, loss
 
     def estimate_loss(self):
         total = 0
-        for _ in range(200):
+        for _ in range(20):
             logits, targets = get_batch()
             _, loss = self(logits, targets)
             total += loss
-        return total / 200
+        return total / 20
 
     def generate(self, tokens: torch.Tensor, max_new_tokens: int, top_k: int | None = None):
         for _ in range(max_new_tokens):
             tokens_ctx = tokens[-ctx_size:]
-            logits, _ = self(tokens_ctx)[-1]
+            logits, _ = self(tokens_ctx.unsqueeze(-2))
+            logits = logits[0]
             if top_k is not None:
                 v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
                 logits[logits < v[:, [-1]]] = -float('inf')
-            
-            probs = torch.softmax(logits, dim=0)
+
+            probs = torch.softmax(logits[-1], dim=0)
             tokens_next = torch.multinomial(probs, num_samples=1)
             tokens = torch.cat((tokens, tokens_next), dim=0)
         return tokens
 
 
 model = DTransformer()
-optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+optimizer = torch.optim.AdamW(model.parameters(), lr=6e-4)
 try:
     for e in range(n_epochs):
         if e % 200 == 0 or e == n_epochs - 1:
-            print(f"epoch {e}: {model.estimate_loss()}")
+            print(f"epoch {e}: {model.estimate_loss():.4f}")
 
         x, y = get_batch()
         logits, loss = model(x, y)
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
-        nn.utils.clip_grad_value_(model.parameters(), clip_value=1.0)
+        nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
 except KeyboardInterrupt:
     pass
 
-prompt_start = torch.randint(len(tokens) - 11, size=(1,))
-print(decode(model.generate(tokens[prompt_start:prompt_start + 11], 500, top_k=32)))
+print(decode(model.generate(torch.zeros(1, dtype=torch.long), 500)))
