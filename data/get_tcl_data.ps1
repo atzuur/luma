@@ -13,7 +13,7 @@ Function Find-NewName {
 }
 
 if (-not (Test-Path .\TCL)) {
-    git clone https://github.com/KQM-git/TCL.git
+    git clone https://github.com/KQM-git/TCL.git TCL-src
 } 
 
 if (Test-Path .\all) {
@@ -22,7 +22,7 @@ if (Test-Path .\all) {
     mkdir .\all
 }
 
-Get-ChildItem .\TCL\docs\* -Include *.md -Exclude _* -Recurse | % {
+Get-ChildItem .\TCL-src\docs\* -Include *.md -Exclude _* -Recurse | % {
     Copy-Item -Path $_ -Destination (Find-NewName ".\all\$((Get-Item $_).Name)")
 }
 python clean_tcl_md.py all
