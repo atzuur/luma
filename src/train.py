@@ -229,14 +229,13 @@ class GPT(nn.Module):
         weight_decay: float,
         learning_rate: float,
         betas: tuple[float, float],
-        device: torch.device
     ):
         params = [p for p in self.parameters() if p.requires_grad]
         optim_groups = [
             {'params': [p for p in params if p.dim() >= 2], 'weight_decay': weight_decay},
             {'params': [p for p in params if p.dim() < 2], 'weight_decay': 0.0}
         ]
-        use_fused = device.type == "cuda"
+        use_fused = self.device.type == "cuda"
         return torch.optim.AdamW(optim_groups, learning_rate, betas, fused=use_fused)
 
     @torch.no_grad()
@@ -288,7 +287,7 @@ def train(
     )
 
     batch_gen = dataset.gen_batch(batch_size, model.ctx_size, model.device)
-    optimizer = model.get_optimizer(weight_decay, learning_rate, betas, model.device)
+    optimizer = model.get_optimizer(weight_decay, learning_rate, betas)
     start_t = time.perf_counter()
 
     for k in range(1, n_steps + 1):
@@ -297,7 +296,7 @@ def train(
             for param_group in optimizer.param_groups:
                 param_group['lr'] = lr
 
-            log_interval = n_steps // 10
+            log_interval = n_steps // 100
             if k % log_interval == 0:
                 end_t = time.perf_counter()
                 avg_t = (end_t - start_t) / log_interval
@@ -321,21 +320,23 @@ def train(
 
 def main():
     vocab_size = 1024
-    ctx_size = 256
-    batch_size = 64
-    n_layers = 6
-    n_heads = 6
-    d_emb = 384
-    n_steps = 5000
+    ctx_size = 512
+    batch_size = 12
+    n_layers = 12
+    n_heads = 12
+    d_emb = 768
+    n_steps = 100000
     n_eval_steps = 20
-    learning_rate = 1e-3
+    learning_rate = 6e-4
     weight_decay = 1e-1
-    betas = (0.9, 0.99)
-    warmup_steps = 100
+    betas = (0.9, 0.95)
+    warmup_steps = 500
 
+    device = "cuda" if torch.cuda.is_available() else "cpu"
     files = [f for f in Path("data/ylilauta").iterdir() if f.suffix == ".txt"]
     dataset = Dataset(f"y{vocab_size}", files, vocab_size)
-    model = GPT(vocab_size, ctx_size, d_emb, n_layers, n_heads)
+    model = GPT(vocab_size, ctx_size, d_emb, n_layers, n_heads).to(device)
+
     train(
         model,
         dataset,
