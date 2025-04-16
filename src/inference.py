@@ -1,4 +1,3 @@
-import sys
 from model import *
 from tokenizer import *
 
@@ -19,19 +18,25 @@ def gen_until(model: GPT, tokens: torch.Tensor, stop_token: int, top_k: int):
     return tokens[prompt_len:]
 
 
+def start_chat(model: GPT, tok: Tokenizer) -> Iterable[str]:
+    context = torch.tensor([], dtype=torch.long)
+    while True:
+        prompt = yield
+        prompt_tok = torch.tensor(tok.encode(prompt + "\n"), device=model.device)
+        context = torch.cat((context, prompt_tok))[-model.ctx_size:]
+        logits = gen_until(model, context, tok.str_to_tok["\n"], 30)
+        context = torch.cat((context, logits))
+        yield tok.decode(logits).strip()
+
+
 def main():
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = "cuda" if torch.cuda.is_available() else "cpu"
     model = torch.load("gpt-ylilauta2-ft.pt", weights_only=False, map_location=device)
     tok = torch.load("y1024-tokenizer.bin", weights_only=False)
 
-    context = torch.tensor([], dtype=torch.long)
-    while True:
-        prompt = torch.tensor(tok.encode(input("Prompt: ") + "\n"), device=device)
-        context = torch.cat((context, prompt))[-model.ctx_size:]
-        logits = gen_until(model, context, tok.str_to_tok["\n"], 30)
-        context = torch.cat((context, logits))
-        print(tok.decode(logits), end="")
-
+    chat = start_chat(model, tok)
+    for _ in chat:
+        print(chat.send(input("Prompt: ")))
 
 if __name__ == "__main__":
     main()
